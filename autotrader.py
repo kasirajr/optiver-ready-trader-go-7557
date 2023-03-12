@@ -24,7 +24,7 @@ from ready_trader_go import BaseAutoTrader, Instrument, Lifespan, MAXIMUM_ASK, M
 
 import math
 
-LOT_SIZE = 20
+LOT_SIZE = 17
 POSITION_LIMIT = 100
 TICK_SIZE_IN_CENTS = 100
 ARBITRAGE_TICKS = 3
@@ -212,7 +212,7 @@ class AutoTrader(BaseAutoTrader):
                     break
             self.position -= volume
             self.send_hedge_order(next(self.order_ids), Side.BID, MAX_ASK_NEAREST_TICK, volume)
-
+        self.check_and_fix_position_breach()
         self.logger.info("received order filled for order %d with price %d and volume %d,"
                          "Actual Position - %d, Real Position(Bid) - %d, Real Position(ASK) - %d", client_order_id,
                          price, volume, self.position, self.get_real_position(Side.BID),
@@ -370,3 +370,21 @@ class AutoTrader(BaseAutoTrader):
                     i[2] = avaliable_lot
                     self.send_insert_order(i[1], Side.SELL, i[0], avaliable_lot, Lifespan.GOOD_FOR_DAY)
                     self.asks.add(i[1])
+
+    def check_and_fix_position_breach(self):
+        if self.get_real_position(Side.BID) > POSITION_LIMIT:
+            lots_to_cancel = self.get_real_position(Side.BID) - POSITION_LIMIT
+            for bid in self.bid_orders:
+                if bid[1] != 0:
+                    lots_to_cancel -= bid[2]
+                    self.send_cancel_order(bid[1])
+                if lots_to_cancel < 0:
+                    break
+        if self.get_real_position(Side.ASK) < -POSITION_LIMIT:
+            lots_to_cancel = -POSITION_LIMIT - self.get_real_position(Side.BID)
+            for ask in self.ask_orders:
+                if ask[1] != 0:
+                    lots_to_cancel -= ask[2]
+                    self.send_cancel_order(ask[1])
+                if lots_to_cancel < 0:
+                    break
