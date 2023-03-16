@@ -24,7 +24,7 @@ from ready_trader_go import BaseAutoTrader, Instrument, Lifespan, MAXIMUM_ASK, M
 
 import math
 
-LOT_SIZE = 17
+LOT_SIZE = 33
 POSITION_LIMIT = 100
 TICK_SIZE_IN_CENTS = 100
 ARBITRAGE_TICKS = 3
@@ -380,6 +380,7 @@ class AutoTrader(BaseAutoTrader):
                     self.send_cancel_order(bid[1])
                 if lots_to_cancel < 0:
                     break
+            self.logger.info("Check and fix breach activated for BID")
         if self.get_real_position(Side.ASK) < -POSITION_LIMIT:
             lots_to_cancel = -POSITION_LIMIT - self.get_real_position(Side.BID)
             for ask in self.ask_orders:
@@ -388,3 +389,4 @@ class AutoTrader(BaseAutoTrader):
                     self.send_cancel_order(ask[1])
                 if lots_to_cancel < 0:
                     break
+            self.logger.info("Check and fix breach activated for ASK")
