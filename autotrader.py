@@ -17,22 +17,32 @@
 #     <https://www.gnu.org/licenses/>.
 import asyncio
 import itertools
+import numpy as np
+from scipy.stats import gmean
 
 from typing import List
 
 from ready_trader_go import BaseAutoTrader, Instrument, Lifespan, MAXIMUM_ASK, MINIMUM_BID, Side
 
-import math
-
-LOT_SIZE = 33
+LOT_SIZE = 30
 POSITION_LIMIT = 100
 TICK_SIZE_IN_CENTS = 100
-ARBITRAGE_TICKS = 5
 KAPPA = 2
+# closer to 0 high risk, closer to 1 low risk
 GAMMA = 0.2
 VOLATILITY = 0.05
 TOTAL_TIME = 900
 MAX_ORDER_TICKS = 3
+ORDER_SPLITS = [0.3, 0.2, 0.2]
+MAIN_ORDER_PERCENT = sum(ORDER_SPLITS)
+MIN_ORDER_SPLITS = [0.5]
+HEDGE_RATIO = 0.4
+IDEAL_HEDGE_RATIO = 0.9
+THRESHOLD_SECONDS_HEDGE = 45
+VOLATILITY_WINDOW = 100
+EMA_WINDOW = 50
+FULL_HEDGE_TICKS = 3
+
 MIN_BID_NEAREST_TICK = (MINIMUM_BID + TICK_SIZE_IN_CENTS) // TICK_SIZE_IN_CENTS * TICK_SIZE_IN_CENTS
 MAX_ASK_NEAREST_TICK = MAXIMUM_ASK // TICK_SIZE_IN_CENTS * TICK_SIZE_IN_CENTS
 
@@ -68,6 +78,12 @@ class AutoTrader(BaseAutoTrader):
         # price, id, volume
         self.bid_orders = []
         self.ask_orders = []
+        self.volatility = VOLATILITY
+        self.traded_bids = np.array([])
+        self.traded_asks = np.array([])
+        self.hedge_volume = 0
+        self.old_position = 0
+        self.last_hedge_filled = self.event_loop.time()
 
     def on_error_message(self, client_order_id: int, error_message: bytes) -> None:
         """Called when the exchange detects an error.
@@ -86,8 +102,7 @@ class AutoTrader(BaseAutoTrader):
         which may be better than the order's limit price. The volume is
         the number of lots filled at that price.
         """
-        # self.logger.info("received hedge filled for order %d with average price %d and volume %d", client_order_id,
-        #                  price, volume)
+        pass
 
     def on_order_book_update_message(self, instrument: int, sequence_number: int, ask_prices: List[int],
                                      ask_volumes: List[int], bid_prices: List[int], bid_volumes: List[int]) -> None:
@@ -101,37 +116,38 @@ class AutoTrader(BaseAutoTrader):
         if self.previous_order_book_sequence_number > sequence_number:
             return
         self.previous_order_book_sequence_number = sequence_number
+
+        if self.event_loop.time() - self.last_hedge_filled > THRESHOLD_SECONDS_HEDGE:
+            self.last_hedge_filled = self.event_loop.time()
+            self.hedge(IDEAL_HEDGE_RATIO)
+
         # update local order book
         self.update_order_book(instrument, ask_prices, ask_volumes, bid_prices, bid_volumes)
-
+        orders_cancelled = False
         while True:
             # check the given prices
-            if bid_prices[0] == 0 or ask_prices[0] == 0: break
+            if bid_prices[0] == 0 or ask_prices[0] == 0:
+                break
 
             # only calculate price when having Future order book
-            if instrument == Instrument.ETF: break
-
-            # check if arbitrage opportunuity exist
-            arb_done = False
-            do_arb, arb_side = self.arbitrage_check()
-            if do_arb:
-                arb_done = self.arbitrage(arb_side)
-            if arb_done: break
+            if instrument == Instrument.ETF:
+                break
 
             # calculate price by AS model
             t = self.event_loop.time() - self.start_time
             time_frac = (TOTAL_TIME - t) / TOTAL_TIME
 
             mid_price = (bid_prices[0] + ask_prices[0]) / 2
-            indiff_price = mid_price - self.position * GAMMA * (VOLATILITY ** 2) * time_frac
-            # spread = 2/GAMMA + math.log(1 + gamma/KAPPA)
-            spread = (GAMMA * (VOLATILITY ** 2) * time_frac + math.log(1 + GAMMA / KAPPA)) * TICK_SIZE_IN_CENTS
+            indiff_price = mid_price - self.position * GAMMA * (self.volatility ** 2) * time_frac
+            # spread = 2/GAMMA + np.log(1 + gamma/KAPPA)
+            spread = (GAMMA * (self.volatility ** 2) * time_frac + np.log(1 + GAMMA / KAPPA)) * TICK_SIZE_IN_CENTS
 
-            new_bid_price = int(math.floor(((indiff_price - spread / 2) / TICK_SIZE_IN_CENTS)) * TICK_SIZE_IN_CENTS)
-            new_ask_price = int(math.ceil(((indiff_price + spread / 2) / TICK_SIZE_IN_CENTS)) * TICK_SIZE_IN_CENTS)
+            new_bid_price = int(np.floor(((indiff_price - spread / 2) / TICK_SIZE_IN_CENTS)) * TICK_SIZE_IN_CENTS)
+            new_ask_price = int(np.ceil(((indiff_price + spread / 2) / TICK_SIZE_IN_CENTS)) * TICK_SIZE_IN_CENTS)
 
             # check the quote
-            if new_bid_price >= new_ask_price: break
+            if new_bid_price >= new_ask_price:
+                break
 
             # go through history orders, cancel previous orders
             new_bid_price_low = new_bid_price - MAX_ORDER_TICKS * TICK_SIZE_IN_CENTS
@@ -140,8 +156,12 @@ class AutoTrader(BaseAutoTrader):
             bid_pops_head = 0
             bid_pops_tail = 0
             for i in self.bid_orders:
-                if i[0] > new_bid_price: bid_pops_head += 1
-                if i[0] < new_bid_price_low: bid_pops_tail += 1
+                if i[0] > new_bid_price:
+                    bid_pops_head += 1
+                if i[0] < new_bid_price_low:
+                    bid_pops_tail += 1
+            if bid_pops_tail > 0 or bid_pops_head > 0:
+                orders_cancelled = False
             self.bid_orders = self.pop_helper(self.bid_orders, bid_pops_head, bid_pops_tail)
 
             # fill the ordre list with possible price
@@ -164,6 +184,8 @@ class AutoTrader(BaseAutoTrader):
             for i in self.ask_orders:
                 if i[0] < new_ask_price: ask_pops_head += 1
                 if i[0] > new_ask_price_high: ask_pops_tail += 1
+            if ask_pops_tail > 0 or ask_pops_head > 0:
+                orders_cancelled = True
             self.ask_orders = self.pop_helper(self.ask_orders, ask_pops_head, ask_pops_tail)
 
             # fill the ordre list with possible price
@@ -182,12 +204,8 @@ class AutoTrader(BaseAutoTrader):
                         self.ask_orders.append([a_price, 0, 0])
 
             # place order
-            self.place_orders()
+            self.place_orders(orders_cancelled)
             break
-        self.logger.info("received order book for instrument %d with sequence number %d, "
-                         "Actual Position - %d, Real Position(Bid) - %d, Real Position(ASK) - %d", instrument,
-                         sequence_number, self.position, self.get_real_position(Side.BID),
-                         self.get_real_position(Side.ASK))
 
     def on_order_filled_message(self, client_order_id: int, price: int, volume: int) -> None:
         """Called when one of your orders is filled, partially or fully.
@@ -203,7 +221,7 @@ class AutoTrader(BaseAutoTrader):
                     i[2] -= volume
                     break
             self.position += volume
-            self.send_hedge_order(next(self.order_ids), Side.ASK, MIN_BID_NEAREST_TICK, volume)
+            # self.send_hedge_order(next(self.order_ids), Side.ASK, MIN_BID_NEAREST_TICK, volume)
         elif client_order_id in self.asks:
             # update remaining volumes
             for i in self.ask_orders:
@@ -211,12 +229,14 @@ class AutoTrader(BaseAutoTrader):
                     i[2] -= volume
                     break
             self.position -= volume
-            self.send_hedge_order(next(self.order_ids), Side.BID, MAX_ASK_NEAREST_TICK, volume)
+            # self.send_hedge_order(next(self.order_ids), Side.BID, MAX_ASK_NEAREST_TICK, volume)
+        if self.old_position > 0 > self.position:
+            self.last_hedge_filled = self.event_loop.time()
+        elif self.old_position < 0 < self.position:
+            self.last_hedge_filled = self.event_loop.time()
+        self.old_position = self.position
+        self.hedge()
         self.check_and_fix_position_breach()
-        self.logger.info("received order filled for order %d with price %d and volume %d,"
-                         "Actual Position - %d, Real Position(Bid) - %d, Real Position(ASK) - %d", client_order_id,
-                         price, volume, self.position, self.get_real_position(Side.BID),
-                         self.get_real_position(Side.ASK))
 
     def on_order_status_message(self, client_order_id: int, fill_volume: int, remaining_volume: int,
                                 fees: int) -> None:
@@ -242,10 +262,7 @@ class AutoTrader(BaseAutoTrader):
                     if client_order_id == ask[1]:
                         del self.ask_orders[i]
                         break
-        self.logger.info("received order status for order %d with fill volume %d remaining %d and fees %d,"
-                         "Actual Position - %d, Real Position(Bid) - %d, Real Position(ASK) - %d",
-                         client_order_id, fill_volume, remaining_volume, fees, self.position,
-                         self.get_real_position(Side.BID), self.get_real_position(Side.ASK))
+            self.place_orders()
 
     def on_trade_ticks_message(self, instrument: int, sequence_number: int, ask_prices: List[int],
                                ask_volumes: List[int], bid_prices: List[int], bid_volumes: List[int]) -> None:
@@ -258,8 +275,30 @@ class AutoTrader(BaseAutoTrader):
         If there are less than five prices on a side, then zeros will appear at
         the end of both the prices and volumes arrays.
         """
-        self.logger.info("received trade ticks for instrument %d with sequence number %d", instrument,
-                         sequence_number)
+        if instrument == Instrument.FUTURE:
+            return
+
+        for bid, ask in zip(bid_prices, ask_prices):
+            if bid == 0 and ask == 0:
+                break
+            if not bid == 0:
+                self.traded_bids = np.append(self.traded_bids, bid)
+            if not ask == 0:
+                self.traded_asks = np.append(self.traded_asks, ask)
+
+        if min(len(self.traded_bids), len(self.traded_asks)) <= 5:
+            return
+        max_size = min(min(len(self.traded_bids), len(self.traded_asks)), VOLATILITY_WINDOW)
+        if max_size == VOLATILITY_WINDOW:
+            self.traded_bids = self.traded_bids[-max_size:]
+            self.traded_asks = self.traded_asks[-max_size:]
+        # calculate mid price
+        mid = abs((self.traded_bids[-max_size:] + self.traded_asks[-max_size:]) / 2)
+        # calculate log returns
+        log_returns = np.diff(np.log(mid))
+        # calculate standard deviation of log returns
+        self.volatility = log_returns.std()
+
 
     def update_order_book(self, instrument: int, ask_prices: List[int]
                           , ask_volumes: List[int], bid_prices: List[int], bid_volumes: List[int]) -> None:
@@ -298,78 +337,45 @@ class AutoTrader(BaseAutoTrader):
                 remain_pos += i[2]
             return self.position + remain_pos
 
-    def arbitrage_check(self):
-        if len(self.etf_LOB.bid_prices) == 0 or len(self.future_LOB.bid_prices) == 0:
-            return False, None
-        etf_bid_price = self.etf_LOB.ask_prices[0]
-        etf_ask_price = self.etf_LOB.bid_prices[0]
-        future_bid_price = self.future_LOB.ask_prices[0]
-        future_ask_price = self.future_LOB.bid_prices[0]
+    def place_orders(self, orders_cancelled=False):
+        i = 0
+        is_small_order = False
+        available_lot = POSITION_LIMIT - self.get_real_position(Side.BID)
+        order_split = ORDER_SPLITS
+        if int(np.floor(available_lot * MAIN_ORDER_PERCENT)) <= LOT_SIZE:
+            order_split = MIN_ORDER_SPLITS
+            is_small_order = True
+        for bid in self.bid_orders:
+            if (orders_cancelled and is_small_order) or (available_lot == 0):
+                break
 
-        if future_ask_price - etf_bid_price > TICK_SIZE_IN_CENTS * ARBITRAGE_TICKS:
-            return True, Side.BID
+            if bid[1] == 0 and self.get_real_position(Side.BID) < POSITION_LIMIT:
+                bid[1] = next(self.order_ids)
+                bid[2] = int(np.floor(available_lot * order_split[i]))
+                self.send_insert_order(bid[1], Side.BUY, bid[0], bid[2], Lifespan.GOOD_FOR_DAY)
+                self.bids.add(bid[1])
+                i += 1
+            if i >= len(order_split):
+                break
+        i = 0
+        available_lot = POSITION_LIMIT + self.get_real_position(Side.ASK)
+        order_split = ORDER_SPLITS
+        is_small_order = False
+        if int(np.floor(available_lot * MAIN_ORDER_PERCENT)) <= LOT_SIZE:
+            order_split = MIN_ORDER_SPLITS
+            is_small_order = True
+        for ask in self.ask_orders:
+            if (orders_cancelled and is_small_order) or (available_lot == 0):
+                break
 
-        elif etf_ask_price - future_bid_price > TICK_SIZE_IN_CENTS * ARBITRAGE_TICKS:
-            return True, Side.ASK
-        else:
-            return False, None
-
-    def arbitrage(self, side):
-
-        if side == Side.BID:
-            # cancel all ask orders
-            arb_bid_price = self.etf_LOB.ask_prices[0]
-            for i in self.ask_orders:
-                if arb_bid_price <= i[0]:
-                    self.send_cancel_order(i[1])
-
-            avaliable_pos = min(LOT_SIZE, POSITION_LIMIT - self.get_real_position(Side.BID),
-                                self.etf_LOB.ask_volumes[0])
-            if avaliable_pos <= 0: return False
-
-            order_id = next(self.order_ids)
-            self.send_insert_order(order_id, Side.BUY, arb_bid_price, avaliable_pos, Lifespan.FILL_AND_KILL)
-            self.bids.add(order_id)
-
-        elif side == Side.ASK:
-            # cancel all bid orders
-            arb_ask_price = self.etf_LOB.bid_prices[0]
-            for i in self.bid_orders:
-                if arb_ask_price <= i[1]:
-                    self.send_cancel_order(i[1])
-
-            avaliable_pos = min(LOT_SIZE, POSITION_LIMIT + self.get_real_position(Side.ASK),
-                                self.etf_LOB.bid_volumes[0])
-            if avaliable_pos <= 0: return False
-
-            order_id = next(self.order_ids)
-            self.send_insert_order(order_id, Side.SELL, arb_ask_price, avaliable_pos, Lifespan.FILL_AND_KILL)
-            self.asks.add(order_id)
-
-        return True
-
-    def place_orders(self):
-        for i in self.bid_orders:
-            if i[1] == 0 and self.get_real_position(Side.BID) < POSITION_LIMIT:
-                avaliable_lot = min(LOT_SIZE, POSITION_LIMIT - self.get_real_position(Side.BID))
-                if avaliable_lot == 0:
-                    break
-                else:
-                    i[1] = next(self.order_ids)
-                    i[2] = avaliable_lot
-                    self.send_insert_order(i[1], Side.BUY, i[0], avaliable_lot, Lifespan.GOOD_FOR_DAY)
-                    self.bids.add(i[1])
-
-        for i in self.ask_orders:
-            if i[1] == 0 and self.get_real_position(Side.ASK) > -POSITION_LIMIT:
-                avaliable_lot = min(LOT_SIZE, POSITION_LIMIT + self.get_real_position(Side.ASK))
-                if avaliable_lot == 0:
-                    break
-                else:
-                    i[1] = next(self.order_ids)
-                    i[2] = avaliable_lot
-                    self.send_insert_order(i[1], Side.SELL, i[0], avaliable_lot, Lifespan.GOOD_FOR_DAY)
-                    self.asks.add(i[1])
+            if ask[1] == 0 and self.get_real_position(Side.ASK) > -POSITION_LIMIT:
+                ask[1] = next(self.order_ids)
+                ask[2] = int(np.floor(available_lot * order_split[i]))
+                self.send_insert_order(ask[1], Side.SELL, ask[0], ask[2], Lifespan.GOOD_FOR_DAY)
+                self.asks.add(ask[1])
+                i += 1
+            if i >= len(order_split):
+                break
 
     def check_and_fix_position_breach(self):
         if self.get_real_position(Side.BID) > POSITION_LIMIT:
@@ -380,7 +386,6 @@ class AutoTrader(BaseAutoTrader):
                     self.send_cancel_order(bid[1])
                 if lots_to_cancel < 0:
                     break
-            self.logger.info("Check and fix breach activated for BID")
         if self.get_real_position(Side.ASK) < -POSITION_LIMIT:
             lots_to_cancel = -POSITION_LIMIT - self.get_real_position(Side.BID)
             for ask in self.ask_orders:
@@ -389,4 +394,20 @@ class AutoTrader(BaseAutoTrader):
                     self.send_cancel_order(ask[1])
                 if lots_to_cancel < 0:
                     break
-            self.logger.info("Check and fix breach activated for ASK")
+
+    def hedge(self, hedge_ratio=HEDGE_RATIO):
+        if len(self.traded_bids) >= EMA_WINDOW and len(self.traded_asks) >= EMA_WINDOW:
+            mid = abs((self.traded_bids[-EMA_WINDOW:] + self.traded_asks[-EMA_WINDOW:]) / 2)
+            ema = gmean(mid)
+            cur_mid = (self.traded_bids[-1] + self.traded_asks[-1])/2
+            if self.position > 0 and cur_mid < ema + FULL_HEDGE_TICKS*TICK_SIZE_IN_CENTS:
+                hedge_ratio = 1
+            if self.position < 0 and cur_mid > ema - FULL_HEDGE_TICKS*TICK_SIZE_IN_CENTS:
+                hedge_ratio = 1
+        position_to_hedge = int(np.floor(-self.position * hedge_ratio)) - self.hedge_volume
+        if position_to_hedge < 0:
+            self.send_hedge_order(next(self.order_ids), Side.ASK, MIN_BID_NEAREST_TICK, -position_to_hedge)
+        elif position_to_hedge > 0:
+            self.send_hedge_order(next(self.order_ids), Side.BID, MAX_ASK_NEAREST_TICK, position_to_hedge)
+        self.hedge_volume += position_to_hedge
+
